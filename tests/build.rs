@@ -2,7 +2,7 @@ use solidity_language_server::build::{build_output_to_diagnostics, ignored_error
 use solidity_language_server::runner::{ForgeRunner, Runner};
 use solidity_language_server::utils::byte_offset_to_position;
 use std::fs;
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position};
 
 static CONTRACT: &str = r#"// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.29;
@@ -121,6 +121,121 @@ async fn test_build_output_to_diagnostics_from_file() {
     assert_eq!(diag.code, Some(NumberOrString::String("9589".to_string())));
     assert!(diag.range.start.line > 0);
     assert!(diag.range.start.character > 0);
+}
+
+#[test]
+fn test_zero_width_solc_diagnostic_expands_to_line_range() {
+    let source = r#"contract A {
+    function f() external {
+        emit ListingCreated(
+            listingId
+        );
+    }
+}
+"#;
+    let offset = source.find(");").expect("closing call line");
+    let build_output = serde_json::json!({
+        "errors": [{
+            "errorCode": "6933",
+            "severity": "error",
+            "message": "Expected primary expression.",
+            "sourceLocation": {
+                "file": "src/A.sol",
+                "start": offset,
+                "end": offset
+            }
+        }]
+    });
+
+    let diagnostics =
+        build_output_to_diagnostics(&build_output, "/tmp/project/src/A.sol", source, &[]);
+
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].message, "Expected primary expression.");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diagnostics[0].range.start, Position::new(4, 8));
+    assert_eq!(diagnostics[0].range.end, Position::new(4, 10));
+    assert!(
+        diagnostics[0].range.end.character > diagnostics[0].range.start.character,
+        "diagnostic range should not be zero-width"
+    );
+}
+
+#[test]
+fn test_trailing_comma_primary_expression_adds_hint_and_ranges_last_argument() {
+    let source = r#"contract A {
+    function f() external {
+        emit ListingCreated(
+            listingId,
+        );
+    }
+}
+"#;
+    let offset = source.find(");").expect("closing call line");
+    let build_output = serde_json::json!({
+        "errors": [{
+            "errorCode": "6933",
+            "severity": "error",
+            "message": "Expected primary expression.",
+            "formattedMessage": "ParserError: Expected primary expression.\n  --> src/A.sol:5:9:\n   |\n5  |         );\n   |         ^\n\n",
+            "sourceLocation": {
+                "file": "src/A.sol",
+                "start": offset,
+                "end": offset
+            }
+        }]
+    });
+
+    let diagnostics =
+        build_output_to_diagnostics(&build_output, "/tmp/project/src/A.sol", source, &[]);
+
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].message.starts_with("ParserError:"));
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("Hint: remove the trailing comma before `)`"),
+        "message: {}",
+        diagnostics[0].message
+    );
+    assert_eq!(diagnostics[0].range.start, Position::new(3, 12));
+    assert_eq!(diagnostics[0].range.end, Position::new(4, 10));
+}
+
+#[test]
+fn test_solc_diagnostic_prefers_formatted_message_for_float_detail() {
+    let source = r#"contract A {
+    event ListingCreated(uint256 indexed listingId, address indexed seller);
+
+    function f(uint256 listingId) external {
+        emit ListingCreated(
+            listingId,
+        );
+    }
+}
+"#;
+    let offset = source.find("ListingCreated(").expect("event call");
+    let build_output = serde_json::json!({
+        "errors": [{
+            "errorCode": "6160",
+            "severity": "error",
+            "message": "Wrong argument count for function call: 1 arguments given but expected 2.",
+            "formattedMessage": "TypeError: Wrong argument count for function call: 1 arguments given but expected 2.\n  --> src/A.sol:5:14:\n   |\n5  |         emit ListingCreated(\n   |              ^^^^^^^^^^^^^^\n\n",
+            "sourceLocation": {
+                "file": "src/A.sol",
+                "start": offset,
+                "end": offset + "ListingCreated".len()
+            }
+        }]
+    });
+
+    let diagnostics =
+        build_output_to_diagnostics(&build_output, "/tmp/project/src/A.sol", source, &[]);
+
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].message.starts_with("TypeError:"));
+    assert!(diagnostics[0].message.contains("--> src/A.sol:5:14"));
+    assert!(diagnostics[0].message.contains("^^^^^^^^^^^^^^"));
 }
 
 #[tokio::test]

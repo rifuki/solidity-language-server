@@ -15,6 +15,7 @@ use crate::semantic_tokens;
 use crate::symbols;
 use crate::types::DocumentUri;
 use crate::types::ErrorCode;
+use crate::types::FileId;
 use crate::utils;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -806,14 +807,13 @@ impl ForgeLsp {
                 );
                 match solc {
                     Ok(data) => {
-                        // Extract diagnostics from the same solc output
-                        let content = tokio::fs::read_to_string(&file_path)
-                            .await
-                            .unwrap_or_default();
+                        // Extract diagnostics from the same live buffer text
+                        // passed to solc so byte offsets and LSP ranges stay
+                        // aligned with the editor, not a stale on-disk file.
                         let build_diags = crate::build::build_output_to_diagnostics(
                             &data,
                             &file_path,
-                            &content,
+                            &params.text,
                             &foundry_cfg.ignored_error_codes,
                         );
                         (Some(lint), Ok(build_diags), Ok(data))
@@ -841,13 +841,10 @@ impl ForgeLsp {
                     .await;
                 match solc_future.await {
                     Ok(data) => {
-                        let content = tokio::fs::read_to_string(&file_path)
-                            .await
-                            .unwrap_or_default();
                         let build_diags = crate::build::build_output_to_diagnostics(
                             &data,
                             &file_path,
-                            &content,
+                            &params.text,
                             &foundry_cfg.ignored_error_codes,
                         );
                         (None, Ok(build_diags), Ok(data))
@@ -1563,6 +1560,125 @@ fn resolve_import_spec_to_abs(
     }
 
     Some(lexical_normalize(&project_root.join(import_path)))
+}
+
+fn text_importable_symbols_for_path(
+    project_root: &Path,
+    import_abs: &Path,
+    remappings: &[String],
+) -> Vec<completion::TopLevelImportable> {
+    let mut visited = HashSet::new();
+    text_importable_symbols_for_path_inner(project_root, import_abs, remappings, 0, &mut visited)
+}
+
+fn text_importable_symbols_for_path_inner(
+    project_root: &Path,
+    import_abs: &Path,
+    remappings: &[String],
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+) -> Vec<completion::TopLevelImportable> {
+    if depth > 6 {
+        return vec![];
+    }
+
+    let normalized = lexical_normalize(import_abs);
+    if !visited.insert(normalized.clone()) {
+        return vec![];
+    }
+
+    let source_text = match std::fs::read_to_string(&normalized) {
+        Ok(source_text) => source_text,
+        Err(_) => {
+            visited.remove(&normalized);
+            return vec![];
+        }
+    };
+    let path = normalized.to_string_lossy().to_string();
+    let mut symbols = completion::text_top_level_importables_for_file(&path, &source_text);
+
+    for alias in completion::text_named_import_aliases(&source_text) {
+        let Some(target_abs) =
+            resolve_import_spec_to_abs(project_root, &normalized, &alias.import_path, remappings)
+        else {
+            continue;
+        };
+        let target_symbols = text_importable_symbols_for_path_inner(
+            project_root,
+            &target_abs,
+            remappings,
+            depth + 1,
+            visited,
+        );
+        if let Some(target_symbol) = target_symbols
+            .iter()
+            .find(|symbol| symbol.name == alias.foreign_name)
+        {
+            let mut reexport = target_symbol.clone();
+            reexport.name = alias.local_name;
+            reexport.declaring_path = path.clone();
+            symbols.push(reexport);
+        } else {
+            symbols.push(completion::TopLevelImportable {
+                name: alias.local_name,
+                declaring_path: path.clone(),
+                node_type: "ImportDirective".to_string(),
+                kind: CompletionItemKind::MODULE,
+            });
+        }
+    }
+
+    visited.remove(&normalized);
+    symbols
+}
+
+fn live_imported_completion_items(
+    cache: Option<&completion::CompletionCache>,
+    project_root: &Path,
+    current_file: &Path,
+    source_text: &str,
+    remappings: &[String],
+) -> Vec<CompletionItem> {
+    let aliases = completion::text_named_import_aliases(source_text);
+    if aliases.is_empty() {
+        return vec![];
+    }
+
+    completion::imported_symbol_completion_items_for_aliases(&aliases, |alias| {
+        let Some(import_abs) =
+            resolve_import_spec_to_abs(project_root, current_file, &alias.import_path, remappings)
+        else {
+            return vec![];
+        };
+
+        let import_abs_str = import_abs.to_string_lossy().to_string();
+        if let Some(symbols) = cache
+            .and_then(|c| completion::importable_symbols_for_path(c, &import_abs_str))
+            .filter(|symbols| {
+                symbols
+                    .iter()
+                    .any(|symbol| symbol.name == alias.foreign_name)
+            })
+        {
+            return symbols;
+        }
+
+        text_importable_symbols_for_path(project_root, &import_abs, remappings)
+    })
+}
+
+fn completion_file_id_for_path(cache: &completion::CompletionCache, path: &Path) -> Option<FileId> {
+    let path_str = path.to_str()?;
+    cache.path_to_file_id.get(path_str).copied().or_else(|| {
+        cache
+            .path_to_file_id
+            .iter()
+            .find_map(|(cache_path, file_id)| {
+                let cache_path_str = cache_path.as_str();
+                (path_str.ends_with(cache_path_str) || cache_path_str.ends_with(path_str))
+                    .then_some(*file_id)
+            })
+    })
 }
 
 fn compute_reverse_import_closure(
@@ -2795,9 +2911,8 @@ impl LanguageServer for ForgeLsp {
                                 // `waitForProgressToken`) unblock —
                                 // otherwise they hang forever waiting on
                                 // a phase-2 that won't run.
-                                let token2 = NumberOrString::String(
-                                    "solidity/projectIndexFull".to_string(),
-                                );
+                                let token2 =
+                                    NumberOrString::String("solidity/projectIndexFull".to_string());
                                 let _ = client
                                     .send_request::<request::WorkDoneProgressCreate>(
                                         WorkDoneProgressCreateParams {
@@ -3876,10 +3991,9 @@ impl LanguageServer for ForgeLsp {
         let file_id = {
             let uri_path = uri.to_file_path().ok();
             cache_ref.and_then(|c| {
-                uri_path.as_ref().and_then(|p| {
-                    let path_str = p.to_str()?;
-                    c.path_to_file_id.get(path_str).copied()
-                })
+                uri_path
+                    .as_ref()
+                    .and_then(|p| completion_file_id_for_path(c, p))
             })
         };
 
@@ -3982,7 +4096,61 @@ impl LanguageServer for ForgeLsp {
             return Ok(None);
         }
 
-        let tail_candidates = if trigger_char == Some(".") {
+        if let Some(ctx) = completion::named_import_completion_context(&source_text, position)
+            && let Ok(current_file) = uri.to_file_path()
+        {
+            let foundry_cfg = self.foundry_config.read().await.clone();
+            let remappings = crate::solc::resolve_remappings(&foundry_cfg).await;
+            if let Some(import_abs) = resolve_import_spec_to_abs(
+                &foundry_cfg.root,
+                &current_file,
+                &ctx.import_path,
+                &remappings,
+            ) {
+                let import_abs_str = import_abs.to_string_lossy().to_string();
+                let mut items = root_cached
+                    .as_deref()
+                    .or(cache_ref)
+                    .map_or_else(Vec::new, |c| {
+                        completion::importable_completion_candidates_for_path(
+                            c,
+                            &import_abs_str,
+                            Some(ctx.typed_range),
+                        )
+                    });
+                if items.is_empty() {
+                    let symbols = text_importable_symbols_for_path(
+                        &foundry_cfg.root,
+                        &import_abs,
+                        &remappings,
+                    );
+                    items =
+                        completion::importable_completion_items(&symbols, Some(ctx.typed_range));
+                }
+                return Ok(Some(CompletionResponse::List(CompletionList {
+                    is_incomplete: items.is_empty(),
+                    items,
+                })));
+            }
+        }
+
+        let live_imported_items = if trigger_char == Some(".") {
+            vec![]
+        } else if let Ok(current_file) = uri.to_file_path() {
+            let foundry_cfg = self.foundry_config.read().await.clone();
+            let remappings = crate::solc::resolve_remappings(&foundry_cfg).await;
+            live_imported_completion_items(
+                root_cached.as_deref().or(cache_ref),
+                &foundry_cfg.root,
+                &current_file,
+                &source_text,
+                &remappings,
+            )
+        } else {
+            vec![]
+        };
+
+        let mut tail_candidates = if trigger_char == Some(".") {
             vec![]
         } else {
             root_cached.as_deref().map_or_else(Vec::new, |c| {
@@ -3994,12 +4162,21 @@ impl LanguageServer for ForgeLsp {
             })
         };
 
-        let result = completion::handle_completion_with_tail_candidates(
+        if !live_imported_items.is_empty() {
+            let imported_labels: HashSet<String> = live_imported_items
+                .iter()
+                .map(|item| item.label.clone())
+                .collect();
+            tail_candidates.retain(|item| !imported_labels.contains(&item.label));
+        }
+
+        let result = completion::handle_completion_with_context_candidates(
             cache_ref,
             &source_text,
             position,
             trigger_char,
             file_id,
+            live_imported_items,
             tail_candidates,
         );
         Ok(result)
@@ -5137,10 +5314,11 @@ impl LanguageServer for ForgeLsp {
         let cached_build = self.get_or_fetch_build(&uri, &file_path, false).await;
         let cached_build = match cached_build {
             Some(cb) => cb,
-            None => return Ok(None),
+            None => return Ok(hover::hover_info_from_text(&source_bytes, position)),
         };
 
-        let result = hover::hover_info(&cached_build, &uri, position, &source_bytes);
+        let result = hover::hover_info(&cached_build, &uri, position, &source_bytes)
+            .or_else(|| hover::hover_info_from_text(&source_bytes, position));
 
         if result.is_some() {
             self.client
