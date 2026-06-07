@@ -4,6 +4,7 @@ use tower_lsp::lsp_types::{
     Documentation, Hover, HoverContents, MarkupContent, MarkupKind, ParameterInformation,
     ParameterLabel, Position, SignatureHelp, SignatureInformation, Url,
 };
+use tree_sitter::{Node, Parser};
 
 #[cfg(test)]
 use crate::goto::CHILD_KEYS;
@@ -1247,6 +1248,7 @@ pub fn hover_info(
         .map(|(_, v)| v.clone())?;
 
     let byte_pos = pos_to_bytes(source_bytes, position);
+    let cursor_identifier = crate::rename::get_identifier_at_position(source_bytes, position);
 
     // Resolve: first try Yul external refs, then normal node lookup
     let node_id = byte_to_decl_via_external_refs(external_refs, id_to_path, &abs_path, byte_pos)
@@ -1262,6 +1264,12 @@ pub fn hover_info(
 
     // Typed DeclNode — O(1) from decl_index
     let typed_decl = cached_build.decl_index.get(&decl_id);
+    if let (Some(identifier), Some(decl)) = (cursor_identifier.as_deref(), typed_decl) {
+        let decl_name = decl.name();
+        if !decl_name.is_empty() && decl_name != identifier {
+            return None;
+        }
+    }
 
     // Build hover content
     let mut parts: Vec<String> = Vec::new();
@@ -1397,6 +1405,151 @@ pub fn hover_info(
         }),
         range: None,
     })
+}
+
+pub fn hover_info_from_text(source_bytes: &[u8], position: Position) -> Option<Hover> {
+    let identifier = crate::rename::get_identifier_at_position(source_bytes, position)?;
+    let source = String::from_utf8_lossy(source_bytes);
+    let signature = text_declaration_signature(&source, &identifier)?;
+
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!("```solidity\n{signature}\n```"),
+        }),
+        range: None,
+    })
+}
+
+fn text_declaration_signature(source: &str, name: &str) -> Option<String> {
+    for keyword in [
+        "event",
+        "error",
+        "function",
+        "modifier",
+        "contract",
+        "interface",
+        "library",
+        "struct",
+        "enum",
+    ] {
+        if let Some(start) = find_keyword_name(source, keyword, name) {
+            return Some(collect_declaration_signature(source, start));
+        }
+    }
+
+    text_variable_signature(source, name)
+}
+
+fn text_variable_signature(source: &str, name: &str) -> Option<String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_solidity::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+
+    find_variable_signature(tree.root_node(), source, name)
+}
+
+fn find_variable_signature(node: Node, source: &str, name: &str) -> Option<String> {
+    if matches!(
+        node.kind(),
+        "state_variable_declaration" | "variable_declaration" | "parameter"
+    ) && child_id_text(node, source) == Some(name)
+    {
+        return Some(
+            source[node.byte_range()]
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+
+    for child in all_children(node) {
+        if let Some(signature) = find_variable_signature(child, source, name) {
+            return Some(signature);
+        }
+    }
+
+    None
+}
+
+fn find_keyword_name(source: &str, keyword: &str, name: &str) -> Option<usize> {
+    for (idx, _) in source.match_indices(keyword) {
+        if idx > 0 && is_identifier_byte(source.as_bytes()[idx - 1]) {
+            continue;
+        }
+
+        let mut pos = idx + keyword.len();
+        if pos < source.len() && is_identifier_byte(source.as_bytes()[pos]) {
+            continue;
+        }
+
+        pos = skip_ws(source, pos);
+        if !source[pos..].starts_with(name) {
+            continue;
+        }
+
+        let end = pos + name.len();
+        if end < source.len() && is_identifier_byte(source.as_bytes()[end]) {
+            continue;
+        }
+
+        return Some(idx);
+    }
+
+    None
+}
+
+fn collect_declaration_signature(source: &str, start: usize) -> String {
+    let mut depth = 0i32;
+    let mut end = source.len();
+
+    for (rel, ch) in source[start..].char_indices() {
+        match ch {
+            '(' | '[' | '<' => depth += 1,
+            ')' | ']' | '>' if depth > 0 => depth -= 1,
+            ';' if depth == 0 => {
+                end = start + rel + ch.len_utf8();
+                break;
+            }
+            '{' if depth == 0 => {
+                end = start + rel;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    source[start..end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn skip_ws(source: &str, mut pos: usize) -> usize {
+    while pos < source.len() && source.as_bytes()[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    pos
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn all_children(node: Node) -> impl Iterator<Item = Node> {
+    (0..node.child_count()).filter_map(move |i| node.child(i as u32))
+}
+
+fn child_id_text<'a>(node: Node<'a>, source_text: &'a str) -> Option<&'a str> {
+    node.children(&mut node.walk())
+        .find(|c| c.kind() == "identifier" && c.is_named())
+        .map(|id| &source_text[id.byte_range()])
 }
 
 #[cfg(test)]
@@ -1549,6 +1702,59 @@ mod tests {
         );
         let sig = build_function_signature(node).unwrap();
         assert!(sig.starts_with("event "));
+    }
+
+    #[test]
+    fn test_text_hover_fallback_finds_multiline_event_signature() {
+        let source = r#"contract C {
+    event ListingCreated(
+        uint256 indexed listingId,
+        address indexed seller,
+        uint256 itemValue
+    );
+
+    function f() external {
+        emit ListingCreated(
+            1,
+            msg.sender
+        );
+    }
+}
+"#;
+        let byte = source
+            .find("ListingCreated(\n            1")
+            .expect("event usage");
+        let position = crate::utils::byte_offset_to_position(source, byte);
+
+        let hover = hover_info_from_text(source.as_bytes(), position).expect("text hover");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("expected markup hover");
+        };
+
+        assert!(markup.value.contains("event ListingCreated("));
+        assert!(markup.value.contains("uint256 indexed listingId"));
+        assert!(markup.value.contains("address indexed seller"));
+    }
+
+    #[test]
+    fn test_text_hover_fallback_finds_state_variable_signature() {
+        let source = r#"contract C {
+    IERC20 public paymentToken;
+
+    function f() external {
+        paymentToken;
+    }
+}
+"#;
+        let byte = source.find("paymentToken;").expect("paymentToken usage");
+        let position = crate::utils::byte_offset_to_position(source, byte);
+
+        let hover = hover_info_from_text(source.as_bytes(), position).expect("text hover");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("expected markup hover");
+        };
+
+        assert!(markup.value.contains("IERC20 public paymentToken"));
     }
 
     #[test]
