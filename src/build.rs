@@ -95,15 +95,13 @@ fn parse_diagnostic(
         .map(|v| v as usize)
         .unwrap_or(start_offset);
 
-    let start = byte_offset_to_position(content, start_offset);
-    let end = byte_offset_to_position(content, end_offset);
+    let range = if is_trailing_comma_primary_expression(err, content, start_offset) {
+        trailing_comma_range(content, start_offset)
+    } else {
+        diagnostic_range(content, start_offset, end_offset)
+    };
 
-    let range = Range { start, end };
-
-    let message = err
-        .get("message")
-        .and_then(|m| m.as_str())
-        .unwrap_or("Unknown error");
+    let message = diagnostic_message(err, content, start_offset);
 
     let severity = match err.get("severity").and_then(|s| s.as_str()) {
         Some("error") => Some(DiagnosticSeverity::ERROR),
@@ -124,11 +122,160 @@ fn parse_diagnostic(
         code,
         code_description: None,
         source: Some("solc".to_string()),
-        message: message.to_string(),
+        message,
         related_information: None,
         tags: None,
         data: None,
     })
+}
+
+fn diagnostic_message(err: &Value, content: &str, start_offset: usize) -> String {
+    let message = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("Unknown error")
+        .trim();
+
+    let mut diagnostic = if let Some(formatted) = err
+        .get("formattedMessage")
+        .and_then(|m| m.as_str())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        if formatted.contains(message) {
+            formatted.to_string()
+        } else {
+            format!("{message}\n\n{formatted}")
+        }
+    } else {
+        message.to_string()
+    };
+
+    if is_trailing_comma_primary_expression(err, content, start_offset)
+        && !diagnostic.contains(TRAILING_COMMA_HINT)
+    {
+        diagnostic.push_str("\n\n");
+        diagnostic.push_str(TRAILING_COMMA_HINT);
+    }
+
+    diagnostic
+}
+
+const TRAILING_COMMA_HINT: &str =
+    "Hint: remove the trailing comma before `)` or add the missing argument.";
+
+fn is_trailing_comma_primary_expression(err: &Value, content: &str, start_offset: usize) -> bool {
+    if err.get("errorCode").and_then(|c| c.as_str()) != Some("6933") {
+        return false;
+    }
+
+    let message = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    if !message.contains("Expected primary expression") {
+        return false;
+    }
+
+    let bytes = content.as_bytes();
+    let mut close = start_offset.min(bytes.len());
+    while close < bytes.len() && bytes[close].is_ascii_whitespace() {
+        close += 1;
+    }
+    if bytes.get(close).copied() != Some(b')') {
+        return false;
+    }
+
+    let mut prev = start_offset.min(bytes.len());
+    while prev > 0 && bytes[prev - 1].is_ascii_whitespace() {
+        prev -= 1;
+    }
+
+    bytes.get(prev.saturating_sub(1)).copied() == Some(b',')
+}
+
+fn trailing_comma_range(content: &str, close_offset: usize) -> Range {
+    let bytes = content.as_bytes();
+    let mut comma = close_offset.min(bytes.len());
+    while comma > 0 && bytes[comma - 1].is_ascii_whitespace() {
+        comma -= 1;
+    }
+
+    if comma == 0 || bytes.get(comma - 1).copied() != Some(b',') {
+        return diagnostic_range(content, close_offset, close_offset);
+    }
+    let comma_offset = comma - 1;
+
+    let (comma_line_start, comma_line_end) = line_bounds(content, comma_offset);
+    let start = content[comma_line_start..comma_line_end]
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(idx, _)| comma_line_start + idx)
+        .unwrap_or(comma_offset);
+
+    let (_, close_line_end) = line_bounds(content, close_offset);
+
+    Range {
+        start: byte_offset_to_position(content, start),
+        end: byte_offset_to_position(content, close_line_end),
+    }
+}
+
+fn diagnostic_range(content: &str, start_offset: usize, end_offset: usize) -> Range {
+    let len = content.len();
+    let start_offset = start_offset.min(len);
+    let end_offset = end_offset.min(len);
+
+    if end_offset > start_offset {
+        return Range {
+            start: byte_offset_to_position(content, start_offset),
+            end: byte_offset_to_position(content, end_offset),
+        };
+    }
+
+    let (line_start, line_end) = line_bounds(content, start_offset);
+    let first_non_ws = content[line_start..line_end]
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(idx, _)| line_start + idx)
+        .unwrap_or(line_start);
+    let expanded_end = if line_end > first_non_ws {
+        line_end
+    } else {
+        next_char_boundary(content, start_offset)
+    };
+
+    Range {
+        start: byte_offset_to_position(content, first_non_ws),
+        end: byte_offset_to_position(content, expanded_end),
+    }
+}
+
+fn line_bounds(content: &str, offset: usize) -> (usize, usize) {
+    let bytes = content.as_bytes();
+    let mut start = offset.min(bytes.len());
+    while start > 0 && bytes[start - 1] != b'\n' {
+        start -= 1;
+    }
+
+    let mut end = offset.min(bytes.len());
+    while end < bytes.len() && bytes[end] != b'\n' && bytes[end] != b'\r' {
+        end += 1;
+    }
+
+    (start, end)
+}
+
+fn next_char_boundary(content: &str, offset: usize) -> usize {
+    if offset >= content.len() {
+        return offset;
+    }
+
+    content[offset..]
+        .chars()
+        .next()
+        .map(|ch| offset + ch.len_utf8())
+        .unwrap_or(offset)
 }
 
 /// Extract error-level diagnostics for files OTHER than the one being compiled.
@@ -192,26 +339,25 @@ pub fn cross_file_error_diagnostics(
             .map(|v| v as usize)
             .unwrap_or(start_offset);
 
-        let start = byte_offset_to_position(&content, start_offset);
-        let end = byte_offset_to_position(&content, end_offset);
-
         let code = err
             .get("errorCode")
             .and_then(|c| c.as_str())
             .map(|s| NumberOrString::String(s.to_string()));
 
-        let message = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("Unknown error");
+        let message = diagnostic_message(err, &content, start_offset);
+        let range = if is_trailing_comma_primary_expression(err, &content, start_offset) {
+            trailing_comma_range(&content, start_offset)
+        } else {
+            diagnostic_range(&content, start_offset, end_offset)
+        };
 
         result.entry(abs_path).or_default().push(Diagnostic {
-            range: Range { start, end },
+            range,
             severity: Some(DiagnosticSeverity::ERROR),
             code,
             code_description: None,
             source: Some("solc".to_string()),
-            message: message.to_string(),
+            message,
             related_information: None,
             tags: None,
             data: None,
