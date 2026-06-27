@@ -727,12 +727,16 @@ pub fn build_completion_cache(
                         && !name.is_empty()
                         && let Some(scope_raw) = tree.get("scope").and_then(|v| v.as_i64())
                     {
+                        let scoped_type_id = type_id
+                            .map(|s| s.to_string())
+                            .or_else(|| type_id_for_member(tree).map(|tid| tid.to_string()))
+                            .unwrap_or_default();
                         scope_declarations
                             .entry(NodeId(scope_raw))
                             .or_default()
                             .push(ScopedDeclaration {
                                 name: name.to_string(),
-                                type_id: type_id.unwrap_or_default().to_string(),
+                                type_id: scoped_type_id,
                                 item: completion_item_for_node(
                                     name,
                                     node_type,

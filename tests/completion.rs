@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use serde_json::{Value, json};
 use solidity_language_server::completion::{
     AccessKind, DotSegment, TextNamedImportAlias, build_completion_cache,
@@ -2057,7 +2059,7 @@ fn test_nested_member_access_prefix_completion_returns_enum_members() {
         source,
         position,
         None,
-        None,
+        Some(FileId(0)),
     ));
 
     assert!(
@@ -2096,6 +2098,149 @@ fn test_nested_member_access_prefix_completion_returns_enum_members() {
     assert!(
         !labels.contains(&"RafluxRaffleV1".to_string()),
         "nested member-access completion must not leak general class completions: {labels:?}"
+    );
+}
+
+#[test]
+fn test_nested_enum_member_completion_uses_referenced_declaration_when_type_id_missing() {
+    let sources = json!({
+        "/tmp/RafluxRaffleV1.sol": {
+            "id": 0,
+            "ast": {
+                "nodeType": "SourceUnit",
+                "id": 131,
+                "absolutePath": "/tmp/RafluxRaffleV1.sol",
+                "src": "0:2000:0",
+                "nodes": [
+                    {
+                        "nodeType": "ContractDefinition",
+                        "id": 61,
+                        "name": "RafluxTypes",
+                        "scope": 131,
+                        "src": "562:109:0",
+                        "contractKind": "library",
+                        "nodes": [
+                            {
+                                "nodeType": "EnumDefinition",
+                                "id": 60,
+                                "name": "ListingStatus",
+                                "src": "588:81:0",
+                                "members": [
+                                    { "nodeType": "EnumValue", "id": 57, "name": "NONE", "src": "617:4:0" },
+                                    { "nodeType": "EnumValue", "id": 58, "name": "ACTIVE", "src": "631:6:0" },
+                                    { "nodeType": "EnumValue", "id": 59, "name": "RANDOM_REQUESTED", "src": "647:16:0" }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "nodeType": "ContractDefinition",
+                        "id": 130,
+                        "name": "RafluxRaffleV1",
+                        "scope": 131,
+                        "src": "673:746:0",
+                        "contractKind": "contract",
+                        "nodes": [
+                            {
+                                "nodeType": "FunctionDefinition",
+                                "id": 129,
+                                "name": "buy",
+                                "scope": 130,
+                                "src": "977:440:0",
+                                "body": {
+                                    "nodeType": "Block",
+                                    "id": 128,
+                                    "src": "1143:274:0",
+                                    "statements": [
+                                        {
+                                            "nodeType": "VariableDeclarationStatement",
+                                            "id": 125,
+                                            "src": "1327:67:0",
+                                            "declarations": [
+                                                {
+                                                    "nodeType": "VariableDeclaration",
+                                                    "id": 121,
+                                                    "name": "status",
+                                                    "scope": 128,
+                                                    "src": "1327:32:0",
+                                                    "typeName": {
+                                                        "nodeType": "UserDefinedTypeName",
+                                                        "id": 120,
+                                                        "src": "1327:25:0",
+                                                        "referencedDeclaration": 60,
+                                                        "pathNode": {
+                                                            "nodeType": "IdentifierPath",
+                                                            "id": 119,
+                                                            "name": "RafluxTypes.ListingStatus",
+                                                            "referencedDeclaration": 60,
+                                                            "nameLocations": ["1327:11:0", "1339:13:0"],
+                                                            "src": "1327:25:0"
+                                                        }
+                                                    }
+                                                }
+                                            ],
+                                            "initialValue": {
+                                                "nodeType": "MemberAccess",
+                                                "id": 124,
+                                                "memberName": "ACTIVE",
+                                                "referencedDeclaration": 58,
+                                                "src": "1362:32:0",
+                                                "expression": {
+                                                    "nodeType": "MemberAccess",
+                                                    "id": 123,
+                                                    "memberName": "ListingStatus",
+                                                    "referencedDeclaration": 60,
+                                                    "src": "1362:25:0",
+                                                    "expression": {
+                                                        "nodeType": "Identifier",
+                                                        "id": 122,
+                                                        "name": "RafluxTypes",
+                                                        "referencedDeclaration": 61,
+                                                        "src": "1362:11:0"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    });
+    let cache = build_completion_cache(&sources, None, None);
+    assert_eq!(
+        solidity_language_server::completion::resolve_name_in_scope(
+            &cache,
+            "RafluxTypes",
+            50,
+            FileId(0),
+        )
+        .as_deref(),
+        Some("__node_id_61"),
+    );
+
+    let source = "contract C { function f() external { RafluxTypes.ListingStatus.ACT } }";
+    let position = Position {
+        line: 0,
+        character: source.find("ACT }").expect("typed enum member prefix") as u32
+            + "ACT".len() as u32,
+    };
+    let labels = response_labels(handle_completion(
+        Some(&cache),
+        source,
+        position,
+        None,
+        None,
+    ));
+
+    assert!(labels.contains(&"ACTIVE".to_string()), "labels: {labels:?}");
+    assert!(labels.contains(&"NONE".to_string()), "labels: {labels:?}");
+    assert!(
+        labels.contains(&"RANDOM_REQUESTED".to_string()),
+        "labels: {labels:?}"
     );
 }
 
